@@ -39,9 +39,11 @@ from rhea.server.rhea_fastmcp import RheaFastMCP
 from rhea.server.client_manager import LocalClientManager, ClientManager
 from rhea.server.schema import AppContext, MCPTool, Settings, PBSSettings, K8Settings
 from rhea.server.utils import create_tool
+from rhea.server.custom_tool_utils import create_custom_tool
 import rhea.server.metrics as metrics
 from rhea.utils.schema import Tool
-from rhea.utils.embedding import get_embedding, get_l2_distance
+from rhea.utils.custom_tool_schema import CustomTool
+from rhea.utils.embedding import get_embedding, get_l2_distance, get_l2_distance_combined
 from rhea.utils.proxy import RheaFileHandle, RheaFileProxy
 from rhea.manager.parsl_config import generate_parsl_config
 
@@ -235,18 +237,22 @@ async def find_tools(query: str, ctx: Context) -> List[MCPTool]:
         query, ctx.request_context.lifespan_context.embedding_client, settings.model
     )
 
-    # Perform RAG
+    # Perform RAG - search both Galaxy and custom tools
     db_sessionmaker: async_sessionmaker[AsyncSession] = (
         ctx.request_context.lifespan_context.db_sessionmaker
     )
 
     async with db_sessionmaker() as session:
-        tools: List[Tool] = await get_l2_distance(query_vector, session, limit=10)
+        galaxy_tools: List[Tool]
+        custom_tools: List[CustomTool]
+        galaxy_tools, custom_tools = await get_l2_distance_combined(
+            query_vector, session, limit=10
+        )
 
     result = []
 
-    # Populate tools
-    for t in tools:
+    # Populate Galaxy tools
+    for t in galaxy_tools:
         tool_function: FastMCPTool = create_tool(t, ctx)
 
         # Add tool to MCP server
@@ -274,6 +280,40 @@ async def find_tools(query: str, ctx: Context) -> List[MCPTool]:
 
         # Add MCPTool to result
         result.append(MCPTool.from_rhea(t))
+
+    # Populate custom tools
+    for t in custom_tools:
+        tool_function: FastMCPTool = create_custom_tool(t, ctx)
+
+        # Add tool to MCP server
+        mcp.add_tool_to_context(
+            fn=tool_function.fn,
+            name=tool_function.name,
+            title=tool_function.title,
+            description=tool_function.description,
+        )
+
+        # Add documentation resource to MCP server
+        mcp.add_resource_to_context(
+            resource=TextResource(
+                uri=AnyUrl(url=f"resource://documentation/{t.name}"),
+                name=f"{t.name} Documentation",
+                description=f"Full documentation for {t.name}",
+                text=(
+                    t.documentation
+                    if t.documentation is not None
+                    else f"Documentation for '{t.name}' is not available."
+                ),
+                mime_type="text/markdown",
+            )
+        )
+
+        # Add custom tool to result (create a simple dict representation)
+        result.append({
+            "name": t.name,
+            "description": t.description,
+            "long_description": t.long_description or "Long description not available.",
+        })
 
     await ctx.request_context.session.send_tool_list_changed()  # notifiactions/tools/list_changed
     await ctx.request_context.session.send_resource_list_changed()  # notifications/resources/list_changed
